@@ -18,12 +18,15 @@ package ansiblerun
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 
+	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/event"
 	"github.com/crossplane/crossplane-runtime/pkg/logging"
+	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/pkg/ratelimiter"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
@@ -31,9 +34,12 @@ import (
 	"github.com/crossplane/provider-ansible/internal/ansible"
 	"github.com/crossplane/provider-ansible/pkg/galaxyutil"
 	"github.com/crossplane/provider-ansible/pkg/runnerutil"
-	getter "github.com/hashicorp/go-getter"
 	"github.com/pkg/errors"
 	"github.com/spf13/afero"
+	"gopkg.in/yaml.v2"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -49,11 +55,16 @@ const (
 	errWriteGitCreds       = "cannot write .git-credentials to /tmp dir"
 	errWriteConfig         = "cannot write ansible collection requirements in" + galaxyutil.RequirementsFile
 	errWriteCreds          = "cannot write Playbook credentials"
-	errRemoteConfiguration = "cannot get remote AnsibleRun configuration "
+	errRemoteConfiguration = "cannot get remote AnsibleRun configuration"
 	errWriteAnsibleRun     = "cannot write AnsibleRun configuration in" + runnerutil.PlaybookYml
+	errMarshalRoles        = "cannot marshal Roles into yaml document"
 	errMkdir               = "cannot make Playbook directory"
 	errInit                = "cannot initialize Ansible client"
 	gitCredentialsFilename = ".git-credentials"
+
+	errGetAnsibleRun     = "cannot get AnsibleRun"
+	errGetLastApplied    = "cannot get last applied"
+	errUnmarshalTemplate = "cannot unmarshal template"
 )
 
 const (
@@ -61,7 +72,15 @@ const (
 )
 
 type params interface {
-	Init(ctx context.Context, cr *v1alpha1.AnsibleRun) (*ansible.Runner, error)
+	Init(ctx context.Context, cr *v1alpha1.AnsibleRun, pc *v1alpha1.ProviderConfig, behaviorVars map[string]string) (*ansible.Runner, error)
+	AddFile(path string, content []byte) error
+	GalaxyInstall(ctx context.Context, behaviorVars map[string]string, isRoleRequirements, isCollectionRequirements bool) error
+}
+
+type ansibleRunner interface {
+	GetAnsibleRunPolicy() *ansible.RunPolicy
+	Run() (string, error)
+	WriteExtraVar(extraVar map[string]interface{}) error
 }
 
 // Setup adds a controller that reconciles AnsibleRun managed resources.
@@ -74,13 +93,24 @@ func Setup(mgr ctrl.Manager, l logging.Logger, rl workqueue.RateLimiter, ansible
 
 	fs := afero.Afero{Fs: afero.NewOsFs()}
 
+	galaxyBinary, err := galaxyutil.GalaxyBinary()
+	if err != nil {
+		return err
+	}
+	runnerBinary, err := runnerutil.RunnerBinary()
+	if err != nil {
+		return err
+	}
+
 	c := &connector{
 		kube:  mgr.GetClient(),
 		usage: resource.NewProviderConfigUsageTracker(mgr.GetClient(), &v1alpha1.ProviderConfigUsage{}),
 		fs:    fs,
 		ansible: func(dir string) params {
 			return ansible.Parameters{
-				WorkingDir:      dir,
+				WorkingDirPath:  dir,
+				GalaxyBinary:    galaxyBinary,
+				RunnerBinary:    runnerBinary,
 				CollectionsPath: ansibleCollectionsPath,
 				RolesPath:       ansibleRolesPath,
 			}
@@ -135,8 +165,16 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, errors.Wrap(err, errGetPC)
 	}
 
-	switch cr.Spec.ForProvider.Source {
-	case v1alpha1.ConfigurationSourceRemote:
+	var requirementRoles []byte
+	if len(cr.Spec.ForProvider.Roles) != 0 {
+		// marshall cr.Spec.ForProvider.Roles entries into yaml document
+		var err error
+		requirementRoles, err = yaml.Marshal(&cr.Spec.ForProvider.Roles)
+		if err != nil {
+			return nil, errors.Wrap(err, errMarshalRoles)
+		}
+		// prepare git credentials for ansible-galaxy to fetch remote roles
+		// TODO(fahed) support other private remote repository
 		// NOTE(ytsarev): Retrieve .git-credentials from Spec to /tmp outside of AnsibleRun directory
 		gitCredDir := filepath.Clean(filepath.Join("/tmp", dir))
 		if err := c.fs.MkdirAll(gitCredDir, 0700); err != nil {
@@ -161,19 +199,8 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 				return nil, errors.Wrap(err, errRemoteConfiguration)
 			}
 		}
-
-		client := getter.Client{
-			Src:  cr.Spec.ForProvider.Module,
-			Dst:  dir,
-			Pwd:  dir,
-			Mode: getter.ClientModeDir,
-		}
-		err := client.Get()
-		if err != nil {
-			return nil, errors.Wrap(err, errRemoteConfiguration)
-		}
-	case v1alpha1.ConfigurationSourceInline:
-		if err := c.fs.WriteFile(filepath.Join(dir, runnerutil.PlaybookYml), []byte(cr.Spec.ForProvider.Module), 0600); err != nil {
+	} else if cr.Spec.ForProvider.PlaybookInline != nil {
+		if err := c.fs.WriteFile(filepath.Join(dir, runnerutil.PlaybookYml), []byte(*cr.Spec.ForProvider.PlaybookInline), 0600); err != nil {
 			return nil, errors.Wrap(err, errWriteAnsibleRun)
 		}
 	}
@@ -190,16 +217,55 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		}
 	}
 
-	// configuration is a list of collections to be installed, it is stored in requirements file
-	if pc.Spec.Configuration != nil {
-		if err := c.fs.WriteFile(filepath.Join(dir, galaxyutil.RequirementsFile), []byte(*pc.Spec.Configuration), 0600); err != nil {
+	ps := c.ansible(dir)
+
+	// prepare behavior vars
+	behaviorVars, err := addBehaviorVars(pc)
+	if err != nil {
+		return nil, err
+	}
+
+	// Requirements is a list of collections/roles to be installed, it is stored in requirements file
+	requirementRolesStr := string(requirementRoles)
+	if pc.Spec.Requirements != nil || requirementRolesStr != "" {
+		req := fmt.Sprintf("%s\n%s", *pc.Spec.Requirements, requirementRolesStr)
+		if err := c.fs.WriteFile(filepath.Join(dir, galaxyutil.RequirementsFile), []byte(req), 0600); err != nil {
 			return nil, errors.Wrap(err, errWriteConfig)
+		}
+		var isCollectionRequirements, isRoleRequirements bool
+		if pc.Spec.Requirements != nil {
+			isCollectionRequirements = true
+		} else if requirementRolesStr != "" {
+			isRoleRequirements = true
+		}
+		// install ansible requirements using ansible-galaxy
+		if err := ps.GalaxyInstall(ctx, behaviorVars, isCollectionRequirements, isRoleRequirements); err != nil {
+			return nil, err
 		}
 	}
 
-	ps := c.ansible(dir)
+	// Committing the AnsibleRun's desired state (contentVars) to the filesystem at p.WorkingDirPath.
+	contentVars := map[string]interface{}{}
+	if len(cr.Spec.ForProvider.Vars) != 0 {
+		for _, v := range cr.Spec.ForProvider.Vars {
+			contentVars[v.Key] = v.Value
+		}
+	}
+	contentVarsBytes, err := json.Marshal(contentVars)
+	if err != nil {
+		return nil, err
+	}
 
-	r, err := ps.Init(ctx, cr)
+	// prepare ansible extravars
+	ansibleEnvDir := filepath.Clean(filepath.Join(dir, "env"))
+	if err := c.fs.MkdirAll(ansibleEnvDir, 0700); resource.Ignore(os.IsExist, err) != nil {
+		return nil, errors.Wrap(err, errMkdir)
+	}
+	if err := ps.AddFile("env/extravars", contentVarsBytes); err != nil {
+		return nil, err
+	}
+
+	r, err := ps.Init(ctx, cr, pc, behaviorVars)
 	if err != nil {
 		return nil, errors.Wrap(err, errInit)
 	}
@@ -208,21 +274,48 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 }
 
 type external struct {
-	runner *ansible.Runner
+	runner ansibleRunner
 	kube   client.Reader
 }
 
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
-	/*re, changes, _ := c.pbCmd.ParseResults(ctx, mg)
+	cr, ok := mg.(*v1alpha1.AnsibleRun)
+	if !ok {
+		return managed.ExternalObservation{}, errors.New(errNotAnsibleRun)
+	}
+	switch c.runner.GetAnsibleRunPolicy().Name {
+	case "ObserveAndDelete", "":
+		if c.runner.GetAnsibleRunPolicy().Name == "" {
+			ansible.SetPolicyRun(mg, "ObserveAndDelete")
+		}
+		if meta.WasDeleted(cr) {
+			return managed.ExternalObservation{ResourceExists: true}, nil
+		}
+		observed := cr.DeepCopy()
+		if err := c.kube.Get(ctx, types.NamespacedName{
+			Namespace: observed.GetNamespace(),
+			Name:      observed.GetName(),
+		}, observed); err != nil {
+			if kerrors.IsNotFound(err) {
+				return managed.ExternalObservation{ResourceExists: false}, nil
+			}
+			return managed.ExternalObservation{}, errors.Wrap(err, errGetAnsibleRun)
+		}
+		var last *v1alpha1.AnsibleRun
+		var err error
+		last, err = getLastApplied(observed)
+		if err != nil {
+			return managed.ExternalObservation{}, errors.Wrap(err, errGetLastApplied)
+		}
 
-	if err != nil {
-		return managed.ExternalObservation{}, err
-	}*/
-	return managed.ExternalObservation{
-		//ResourceExists:          re,
-		//ResourceUpToDate:        !changes,
-		ResourceLateInitialized: false,
-	}, nil
+		return c.handleLastApplied(last, cr)
+	case "CheckWhenObserve":
+		// TODO
+	default:
+
+	}
+
+	return managed.ExternalObservation{}, nil
 }
 
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
@@ -259,7 +352,92 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 		return errors.New(errNotAnsibleRun)
 	}
 
-	fmt.Printf("Deleting: %+v", cr)
+	cr.Status.SetConditions(xpv1.Deleting())
 
+	switch c.runner.GetAnsibleRunPolicy().Name {
+	case "ObserveAndDelete", "":
+		stateVar := map[string]string{"state": "absent"}
+		nestedMap := map[string]interface{}{cr.GetName(): stateVar}
+		if err := c.runner.WriteExtraVar(nestedMap); err != nil {
+			return err
+		}
+		out, err := c.runner.Run()
+		if err != nil {
+			return errors.Wrap(err, out)
+		}
+	case "CheckWhenObserve":
+		// TODO
+	default:
+
+	}
 	return nil
 }
+
+func getLastApplied(observed *v1alpha1.AnsibleRun) (*v1alpha1.AnsibleRun, error) {
+	lastApplied, ok := observed.GetAnnotations()[v1.LastAppliedConfigAnnotation]
+	if !ok {
+		return nil, nil
+	}
+
+	last := &v1alpha1.AnsibleRun{}
+	if err := json.Unmarshal([]byte(lastApplied), last); err != nil {
+		return nil, errors.Wrap(err, errUnmarshalTemplate)
+	}
+
+	if last.GetName() == "" {
+		last.SetName(observed.GetName())
+	}
+
+	return last, nil
+}
+
+// nolint: gocyclo
+// TODO reduce cyclomatic complexity
+func (c *external) handleLastApplied(last, desired *v1alpha1.AnsibleRun) (managed.ExternalObservation, error) {
+	isUpToDate := false
+
+	if last != nil && equality.Semantic.DeepEqual(last, desired) {
+		// Mark as up-to-date since last is equal to desired
+		isUpToDate = true
+	}
+
+	if !isUpToDate {
+		stateVar := map[string]string{"state": "present"}
+		nestedMap := map[string]interface{}{desired.GetName(): stateVar}
+		if err := c.runner.WriteExtraVar(nestedMap); err != nil {
+			return managed.ExternalObservation{}, err
+		}
+		out, err := c.runner.Run()
+		if err != nil {
+			return managed.ExternalObservation{}, errors.Wrap(err, out)
+		}
+	}
+
+	return managed.ExternalObservation{}, nil
+}
+
+func addBehaviorVars(pc *v1alpha1.ProviderConfig) (map[string]string, error) {
+	behaviorVars := make(map[string]string, len(pc.Spec.Vars))
+	for _, v := range pc.Spec.Vars {
+		varB, err := json.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(varB, &behaviorVars); err != nil {
+			return nil, err
+		}
+	}
+	return behaviorVars, nil
+}
+
+/*func getDesired(cr *v1alpha1.AnsibleRun) (*unstructured.Unstructured, error) {
+	desired := &unstructured.Unstructured{}
+	if _, err := json.Unmarshal([]byte(cr.Spec.ForProvider), desired); err != nil {
+		return nil, errors.Wrap(err, errUnmarshalTemplate)
+	}
+
+	if desired.GetName() == "" {
+		desired.SetName(cr.GetName())
+	}
+	return desired, nil
+}*/
