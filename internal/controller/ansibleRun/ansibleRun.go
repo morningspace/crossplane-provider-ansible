@@ -19,10 +19,12 @@ package ansiblerun
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
+	"github.com/apenella/go-ansible/pkg/stdoutcallback/results"
 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/event"
 	"github.com/crossplane/crossplane-runtime/pkg/logging"
@@ -73,14 +75,14 @@ const (
 
 type params interface {
 	Init(ctx context.Context, cr *v1alpha1.AnsibleRun, pc *v1alpha1.ProviderConfig, behaviorVars map[string]string) (*ansible.Runner, error)
-	AddFile(path string, content []byte) error
-	GalaxyInstall(ctx context.Context, behaviorVars map[string]string, isRoleRequirements, isCollectionRequirements bool) error
+	GalaxyInstall(ctx context.Context, behaviorVars map[string]string, requirementsType string) error
 }
 
 type ansibleRunner interface {
 	GetAnsibleRunPolicy() *ansible.RunPolicy
-	Run() (string, error)
 	WriteExtraVar(extraVar map[string]interface{}) error
+	EnableCheckMode(checkMode bool)
+	Run() (*exec.Cmd, error)
 }
 
 // Setup adds a controller that reconciles AnsibleRun managed resources.
@@ -168,8 +170,10 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	var requirementRoles []byte
 	if len(cr.Spec.ForProvider.Roles) != 0 {
 		// marshall cr.Spec.ForProvider.Roles entries into yaml document
+		rolesMap := make(map[string][]v1alpha1.Role)
+		rolesMap["roles"] = cr.Spec.ForProvider.Roles
 		var err error
-		requirementRoles, err = yaml.Marshal(&cr.Spec.ForProvider.Roles)
+		requirementRoles, err = yaml.Marshal(&rolesMap)
 		if err != nil {
 			return nil, errors.Wrap(err, errMarshalRoles)
 		}
@@ -228,41 +232,34 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	// Requirements is a list of collections/roles to be installed, it is stored in requirements file
 	requirementRolesStr := string(requirementRoles)
 	if pc.Spec.Requirements != nil || requirementRolesStr != "" {
-		req := fmt.Sprintf("%s\n%s", *pc.Spec.Requirements, requirementRolesStr)
+		var requirementsType string
+		var reqSlice []string
+		if pc.Spec.Requirements != nil {
+			reqSlice = append(reqSlice, *pc.Spec.Requirements)
+			requirementsType = "collection"
+		}
+		if requirementRolesStr != "" {
+			reqSlice = append(reqSlice, requirementRolesStr)
+			requirementsType = "role"
+		}
+
+		// write requirements to requirements.yml
+		req := strings.Join(reqSlice, "\n")
 		if err := c.fs.WriteFile(filepath.Join(dir, galaxyutil.RequirementsFile), []byte(req), 0600); err != nil {
 			return nil, errors.Wrap(err, errWriteConfig)
 		}
-		var isCollectionRequirements, isRoleRequirements bool
-		if pc.Spec.Requirements != nil {
-			isCollectionRequirements = true
-		} else if requirementRolesStr != "" {
-			isRoleRequirements = true
-		}
 		// install ansible requirements using ansible-galaxy
-		if err := ps.GalaxyInstall(ctx, behaviorVars, isCollectionRequirements, isRoleRequirements); err != nil {
-			return nil, err
+		switch requirementsType {
+		case "collection":
+			if err := ps.GalaxyInstall(ctx, behaviorVars, requirementsType); err != nil {
+				return nil, err
+			}
+		case "role":
+			if err := ps.GalaxyInstall(ctx, behaviorVars, requirementsType); err != nil {
+				return nil, err
+			}
 		}
-	}
 
-	// Committing the AnsibleRun's desired state (contentVars) to the filesystem at p.WorkingDirPath.
-	contentVars := map[string]interface{}{}
-	if len(cr.Spec.ForProvider.Vars) != 0 {
-		for _, v := range cr.Spec.ForProvider.Vars {
-			contentVars[v.Key] = v.Value
-		}
-	}
-	contentVarsBytes, err := json.Marshal(contentVars)
-	if err != nil {
-		return nil, err
-	}
-
-	// prepare ansible extravars
-	ansibleEnvDir := filepath.Clean(filepath.Join(dir, "env"))
-	if err := c.fs.MkdirAll(ansibleEnvDir, 0700); resource.Ignore(os.IsExist, err) != nil {
-		return nil, errors.Wrap(err, errMkdir)
-	}
-	if err := ps.AddFile("env/extravars", contentVarsBytes); err != nil {
-		return nil, err
 	}
 
 	r, err := ps.Init(ctx, cr, pc, behaviorVars)
@@ -275,9 +272,11 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 
 type external struct {
 	runner ansibleRunner
-	kube   client.Reader
+	kube   client.Client
 }
 
+// nolint: gocyclo
+// TODO reduce cyclomatic complexity
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
 	cr, ok := mg.(*v1alpha1.AnsibleRun)
 	if !ok {
@@ -286,7 +285,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	switch c.runner.GetAnsibleRunPolicy().Name {
 	case "ObserveAndDelete", "":
 		if c.runner.GetAnsibleRunPolicy().Name == "" {
-			ansible.SetPolicyRun(mg, "ObserveAndDelete")
+			ansible.SetPolicyRun(cr, "ObserveAndDelete")
 		}
 		if meta.WasDeleted(cr) {
 			return managed.ExternalObservation{ResourceExists: true}, nil
@@ -301,16 +300,40 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 			}
 			return managed.ExternalObservation{}, errors.Wrap(err, errGetAnsibleRun)
 		}
-		var last *v1alpha1.AnsibleRun
+		var lastParameters *v1alpha1.AnsibleRunParameters
 		var err error
-		last, err = getLastApplied(observed)
+		lastParameters, err = getLastAppliedParameters(observed)
 		if err != nil {
 			return managed.ExternalObservation{}, errors.Wrap(err, errGetLastApplied)
 		}
-
-		return c.handleLastApplied(last, cr)
+		return c.handleLastApplied(ctx, lastParameters, cr)
 	case "CheckWhenObserve":
-		// TODO
+		stateVar := make(map[string]string)
+		stateVar["state"] = "present"
+		nestedMap := make(map[string]interface{})
+		nestedMap[cr.GetName()] = stateVar
+		if err := c.runner.WriteExtraVar(nestedMap); err != nil {
+			return managed.ExternalObservation{}, err
+		}
+		c.runner.EnableCheckMode(true)
+		dc, err := c.runner.Run()
+		if err != nil {
+			return managed.ExternalObservation{}, err
+		}
+		res, err := results.ParseJSONResultsStream(os.Stdout)
+		if err != nil {
+			return managed.ExternalObservation{}, err
+		}
+		if err = dc.Wait(); err != nil {
+			return managed.ExternalObservation{}, err
+		}
+		changes, exists := ansible.Diff(res)
+
+		return managed.ExternalObservation{
+			ResourceExists:          exists,
+			ResourceUpToDate:        !changes,
+			ResourceLateInitialized: false,
+		}, nil
 	default:
 
 	}
@@ -319,34 +342,32 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 }
 
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
-
-	// TODO see ConnectionDetails
-	/*err := c.pbCmd.CreateOrUpdate(ctx, mg)
-	if err != nil {
-		return managed.ExternalCreation{}, err
-	}*/
-
-	return managed.ExternalCreation{
-		// Optionally return any details that may be required to connect to the
-		// external resource. These will be stored as the connection secret.
-		ConnectionDetails: managed.ConnectionDetails{},
-	}, nil
+	// No difference from the provider side which lifecycle method to choose in this case of Create() or Update()
+	u, err := c.Update(ctx, mg)
+	return managed.ExternalCreation{ConnectionDetails: u.ConnectionDetails}, err
 }
 
 func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.ExternalUpdate, error) {
+	_, ok := mg.(*v1alpha1.AnsibleRun)
+	if !ok {
+		return managed.ExternalUpdate{}, errors.New(errNotAnsibleRun)
+	}
 
-	/*err := c.pbCmd.CreateOrUpdate(ctx, mg)
+	// disable checkMode for real action
+	c.runner.EnableCheckMode(false)
+	dc, err := c.runner.Run()
 	if err != nil {
 		return managed.ExternalUpdate{}, err
-	}*/
-	return managed.ExternalUpdate{
-		// Optionally return any details that may be required to connect to the
-		// external resource. These will be stored as the connection secret.
-		ConnectionDetails: managed.ConnectionDetails{},
-	}, nil
+	}
+	if err = dc.Wait(); err != nil {
+		return managed.ExternalUpdate{}, err
+	}
+
+	// TODO handle ConnectionDetails https://github.com/multicloudlab/crossplane-provider-ansible/pull/74#discussion_r888467991
+	return managed.ExternalUpdate{ConnectionDetails: nil}, nil
 }
 
-func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
+func (c *external) Delete(_ context.Context, mg resource.Managed) error {
 	cr, ok := mg.(*v1alpha1.AnsibleRun)
 	if !ok {
 		return errors.New(errNotAnsibleRun)
@@ -354,66 +375,84 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 
 	cr.Status.SetConditions(xpv1.Deleting())
 
-	switch c.runner.GetAnsibleRunPolicy().Name {
-	case "ObserveAndDelete", "":
-		stateVar := map[string]string{"state": "absent"}
-		nestedMap := map[string]interface{}{cr.GetName(): stateVar}
-		if err := c.runner.WriteExtraVar(nestedMap); err != nil {
-			return err
-		}
-		out, err := c.runner.Run()
-		if err != nil {
-			return errors.Wrap(err, out)
-		}
-	case "CheckWhenObserve":
-		// TODO
-	default:
-
+	stateVar := make(map[string]string)
+	stateVar["state"] = "absent"
+	nestedMap := make(map[string]interface{})
+	nestedMap[cr.GetName()] = stateVar
+	if err := c.runner.WriteExtraVar(nestedMap); err != nil {
+		return err
+	}
+	dc, err := c.runner.Run()
+	if err != nil {
+		return err
+	}
+	if err = dc.Wait(); err != nil {
+		return err
 	}
 	return nil
 }
 
-func getLastApplied(observed *v1alpha1.AnsibleRun) (*v1alpha1.AnsibleRun, error) {
+func getLastAppliedParameters(observed *v1alpha1.AnsibleRun) (*v1alpha1.AnsibleRunParameters, error) {
 	lastApplied, ok := observed.GetAnnotations()[v1.LastAppliedConfigAnnotation]
 	if !ok {
 		return nil, nil
 	}
-
-	last := &v1alpha1.AnsibleRun{}
-	if err := json.Unmarshal([]byte(lastApplied), last); err != nil {
+	lastParameters := &v1alpha1.AnsibleRunParameters{}
+	if err := json.Unmarshal([]byte(lastApplied), lastParameters); err != nil {
 		return nil, errors.Wrap(err, errUnmarshalTemplate)
 	}
 
-	if last.GetName() == "" {
-		last.SetName(observed.GetName())
-	}
-
-	return last, nil
+	return lastParameters, nil
 }
 
 // nolint: gocyclo
 // TODO reduce cyclomatic complexity
-func (c *external) handleLastApplied(last, desired *v1alpha1.AnsibleRun) (managed.ExternalObservation, error) {
+func (c *external) handleLastApplied(ctx context.Context, lastParameters *v1alpha1.AnsibleRunParameters, desired *v1alpha1.AnsibleRun) (managed.ExternalObservation, error) {
 	isUpToDate := false
-
-	if last != nil && equality.Semantic.DeepEqual(last, desired) {
-		// Mark as up-to-date since last is equal to desired
-		isUpToDate = true
+	if lastParameters != nil {
+		if equality.Semantic.DeepEqual(*lastParameters, desired.Spec.ForProvider) {
+			// Mark as up-to-date since last is equal to desired
+			isUpToDate = true
+		}
 	}
 
 	if !isUpToDate {
-		stateVar := map[string]string{"state": "present"}
-		nestedMap := map[string]interface{}{desired.GetName(): stateVar}
+		stateVar := make(map[string]string)
+		stateVar["state"] = "present"
+		nestedMap := make(map[string]interface{})
+		nestedMap[desired.GetName()] = stateVar
 		if err := c.runner.WriteExtraVar(nestedMap); err != nil {
 			return managed.ExternalObservation{}, err
 		}
-		out, err := c.runner.Run()
+		dc, err := c.runner.Run()
 		if err != nil {
-			return managed.ExternalObservation{}, errors.Wrap(err, out)
+			return managed.ExternalObservation{}, err
+		}
+		if err = dc.Wait(); err != nil {
+			return managed.ExternalObservation{}, err
+		}
+
+		out, err := json.Marshal(desired.Spec.ForProvider)
+		if err != nil {
+			return managed.ExternalObservation{}, err
+		}
+		// set LastAppliedConfig Annotation to avoid useless cmd run
+		meta.AddAnnotations(desired, map[string]string{
+			v1.LastAppliedConfigAnnotation: string(out),
+		})
+		// set Deletion Policy to Orphan for non-existence of external resource
+		desired.SetDeletionPolicy(xpv1.DeletionOrphan)
+
+		if err := c.kube.Update(ctx, desired); err != nil {
+			return managed.ExternalObservation{}, err
 		}
 	}
 
-	return managed.ExternalObservation{}, nil
+	// The crossplane runtime is not aware of the external resource created by ansible content.
+	// Nothing will notify us if and when the ansible content we manage
+	// changes, so we requeue a speculative reconcile after the specified poll
+	// interval in order to observe it and react accordingly.
+	return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: true}, nil
 }
 
 func addBehaviorVars(pc *v1alpha1.ProviderConfig) (map[string]string, error) {
@@ -429,15 +468,3 @@ func addBehaviorVars(pc *v1alpha1.ProviderConfig) (map[string]string, error) {
 	}
 	return behaviorVars, nil
 }
-
-/*func getDesired(cr *v1alpha1.AnsibleRun) (*unstructured.Unstructured, error) {
-	desired := &unstructured.Unstructured{}
-	if _, err := json.Unmarshal([]byte(cr.Spec.ForProvider), desired); err != nil {
-		return nil, errors.Wrap(err, errUnmarshalTemplate)
-	}
-
-	if desired.GetName() == "" {
-		desired.SetName(cr.GetName())
-	}
-	return desired, nil
-}*/
